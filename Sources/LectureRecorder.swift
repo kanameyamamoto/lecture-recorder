@@ -29,6 +29,7 @@ struct Config: Codable {
     var currentSemester: String        // 録音に使う学期
     var otherKinds: [String]           // フリー録音の種類（例: ゼミ）。学期とは関係なく共通
     var keepAudioDays: Int             // 文字起こし済みの音声を残す日数
+    var driveAccount: String? = nil    // 保存先のGoogleドライブのアカウント（"local" なら書類フォルダ）
 
     /// 録音に使う学期の授業
     var classes: [ClassEntry] {
@@ -53,7 +54,7 @@ struct Config: Codable {
     }
 
     private enum CodingKeys: String, CodingKey {
-        case outputFolder, periods, semesters, currentSemester, otherKinds, keepAudioDays, classes
+        case outputFolder, periods, semesters, currentSemester, otherKinds, keepAudioDays, classes, driveAccount
     }
 
     /// 学期の仕組みを入れる前の設定ファイル（classes だけのもの）も読めるようにする
@@ -61,6 +62,7 @@ struct Config: Codable {
         let c = try decoder.container(keyedBy: CodingKeys.self)
         let d = Config.default
         outputFolder = try c.decodeIfPresent(String.self, forKey: .outputFolder)
+        driveAccount = try c.decodeIfPresent(String.self, forKey: .driveAccount)
         periods = try c.decodeIfPresent([String: String].self, forKey: .periods) ?? d.periods
         otherKinds = try c.decodeIfPresent([String].self, forKey: .otherKinds) ?? d.otherKinds
         keepAudioDays = try c.decodeIfPresent(Int.self, forKey: .keepAudioDays) ?? d.keepAudioDays
@@ -78,6 +80,7 @@ struct Config: Codable {
     func encode(to encoder: Encoder) throws {
         var c = encoder.container(keyedBy: CodingKeys.self)
         try c.encodeIfPresent(outputFolder, forKey: .outputFolder)
+        try c.encodeIfPresent(driveAccount, forKey: .driveAccount)
         try c.encode(periods, forKey: .periods)
         try c.encode(semesters, forKey: .semesters)
         try c.encode(currentSemester, forKey: .currentSemester)
@@ -122,18 +125,23 @@ enum Paths {
     static var audioBroken: URL { audio.appendingPathComponent("broken", isDirectory: true) }   // 読み込めない録音
 
     /// Googleドライブ（パソコン版）のマイドライブを探す
-    static func googleDriveRoot() -> URL? {
+    /// パソコン版のGoogleドライブでログインしているアカウントと、そのマイドライブ
+    static func googleDriveAccounts() -> [(account: String, myDrive: URL)] {
         let fm = FileManager.default
         let cloud = fm.homeDirectoryForCurrentUser.appendingPathComponent("Library/CloudStorage", isDirectory: true)
-        guard let items = try? fm.contentsOfDirectory(atPath: cloud.path) else { return nil }
+        guard let items = try? fm.contentsOfDirectory(atPath: cloud.path) else { return [] }
+        var result: [(account: String, myDrive: URL)] = []
         for item in items.sorted() where item.hasPrefix("GoogleDrive-") {
             for myDrive in ["マイドライブ", "My Drive"] {
                 let url = cloud.appendingPathComponent(item).appendingPathComponent(myDrive, isDirectory: true)
                 var isDir: ObjCBool = false
-                if fm.fileExists(atPath: url.path, isDirectory: &isDir), isDir.boolValue { return url }
+                if fm.fileExists(atPath: url.path, isDirectory: &isDir), isDir.boolValue {
+                    result.append((account: String(item.dropFirst("GoogleDrive-".count)), myDrive: url))
+                    break
+                }
             }
         }
-        return nil
+        return result
     }
 }
 
@@ -538,9 +546,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
         if let custom = config.outputFolder, !custom.isEmpty {
             return URL(fileURLWithPath: (custom as NSString).expandingTildeInPath, isDirectory: true)
         }
-        // パソコン版のGoogleドライブがあればマイドライブに、なければ「書類」フォルダに保存
-        if let drive = Paths.googleDriveRoot() {
-            return drive.appendingPathComponent("LectureRecorder", isDirectory: true)
+        // メニューで選んだGoogleドライブのアカウント → なければ最初に見つかったアカウント → なければ「書類」フォルダ
+        let accounts = Paths.googleDriveAccounts()
+        if config.driveAccount != "local" {
+            let chosen = accounts.first { $0.account == config.driveAccount } ?? accounts.first
+            if let drive = chosen {
+                return drive.myDrive.appendingPathComponent("LectureRecorder", isDirectory: true)
+            }
         }
         let documents = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
         return documents.appendingPathComponent("LectureRecorder", isDirectory: true)
@@ -645,6 +657,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
 
         // フォルダ・ファイルを開くもの
         menu.addItem(.separator())
+        menu.addItem(saveLocationMenuItem())
         menu.addItem(item("保存先フォルダを開く", #selector(openOutputTapped)))
         menu.addItem(item("詳細設定ファイルを開く…", #selector(editConfigTapped)))
         let login = item("ログイン時に起動", #selector(toggleLoginTapped))
@@ -653,6 +666,45 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
 
         menu.addItem(.separator())
         menu.addItem(item("LectureRecorderを終了", #selector(quitTapped)))
+    }
+
+    /// 保存先（Googleドライブのアカウント／書類フォルダ）を選ぶメニュー
+    private func saveLocationMenuItem() -> NSMenuItem {
+        let accounts = Paths.googleDriveAccounts()
+        let current = outputRoot()?.path ?? ""
+        let currentTitle: String
+        if let a = accounts.first(where: { current.hasPrefix($0.myDrive.path) }) {
+            currentTitle = "Googleドライブ（\(a.account)）"
+        } else {
+            currentTitle = "書類フォルダ"
+        }
+        let parent = NSMenuItem(title: "保存先：\(currentTitle)", action: nil, keyEquivalent: "")
+        let sub = NSMenu()
+        for a in accounts {
+            let i = item("Googleドライブ（\(a.account)）", #selector(chooseSaveLocationTapped(_:)))
+            i.representedObject = a.account
+            i.state = current.hasPrefix(a.myDrive.path) ? .on : .off
+            sub.addItem(i)
+        }
+        if accounts.isEmpty {
+            let none = NSMenuItem(title: "パソコン版のGoogleドライブが見つかりません", action: nil, keyEquivalent: "")
+            none.isEnabled = false
+            sub.addItem(none)
+        }
+        sub.addItem(.separator())
+        let local = item("書類フォルダ（Mac内だけ）", #selector(chooseSaveLocationTapped(_:)))
+        local.representedObject = "local"
+        local.state = currentTitle == "書類フォルダ" ? .on : .off
+        sub.addItem(local)
+        parent.submenu = sub
+        return parent
+    }
+
+    @objc private func chooseSaveLocationTapped(_ sender: NSMenuItem) {
+        guard let value = sender.representedObject as? String else { return }
+        config.driveAccount = value
+        config.outputFolder = nil   // 詳細設定で直接指定していた保存先より、メニューの選択を優先
+        saveConfig()
     }
 
     private func item(_ title: String, _ action: Selector) -> NSMenuItem {
