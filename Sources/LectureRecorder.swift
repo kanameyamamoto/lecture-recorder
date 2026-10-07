@@ -659,7 +659,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
         menu.addItem(.separator())
         menu.addItem(saveLocationMenuItem())
         menu.addItem(item("保存先フォルダを開く", #selector(openOutputTapped)))
-        menu.addItem(item("詳細設定ファイルを開く…", #selector(editConfigTapped)))
         let login = item("ログイン時に起動", #selector(toggleLoginTapped))
         login.state = SMAppService.mainApp.status == .enabled ? .on : .off
         menu.addItem(login)
@@ -668,34 +667,46 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
         menu.addItem(item("LectureRecorderを終了", #selector(quitTapped)))
     }
 
-    /// 保存先（Googleドライブのアカウント／書類フォルダ）を選ぶメニュー
+    /// 保存先（Googleドライブのアカウント／Mac内の書類フォルダ）を選ぶメニュー
     private func saveLocationMenuItem() -> NSMenuItem {
         let accounts = Paths.googleDriveAccounts()
         let current = outputRoot()?.path ?? ""
-        let currentTitle: String
-        if let a = accounts.first(where: { current.hasPrefix($0.myDrive.path) }) {
-            currentTitle = "Googleドライブ（\(a.account)）"
-        } else {
-            currentTitle = "書類フォルダ"
-        }
-        let parent = NSMenuItem(title: "保存先：\(currentTitle)", action: nil, keyEquivalent: "")
+        let parent = NSMenuItem(title: "保存先フォルダを編集", action: nil, keyEquivalent: "")
         let sub = NSMenu()
+
+        let header = NSMenuItem(title: "Googleドライブ", action: nil, keyEquivalent: "")
+        header.isEnabled = false
+        sub.addItem(header)
+        var onDrive = false
         for a in accounts {
-            let i = item("Googleドライブ（\(a.account)）", #selector(chooseSaveLocationTapped(_:)))
+            let i = item(a.account, #selector(chooseSaveLocationTapped(_:)))
             i.representedObject = a.account
-            i.state = current.hasPrefix(a.myDrive.path) ? .on : .off
+            i.indentationLevel = 1
+            if current.hasPrefix(a.myDrive.path) { i.state = .on; onDrive = true }
             sub.addItem(i)
         }
         if accounts.isEmpty {
-            let none = NSMenuItem(title: "パソコン版のGoogleドライブが見つかりません", action: nil, keyEquivalent: "")
+            let none = NSMenuItem(title: "見つかりません", action: nil, keyEquivalent: "")
             none.isEnabled = false
+            none.indentationLevel = 1
             sub.addItem(none)
         }
         sub.addItem(.separator())
-        let local = item("書類フォルダ（Mac内だけ）", #selector(chooseSaveLocationTapped(_:)))
+        // 設定ファイルで好きなフォルダを指定しているときは、そのフォルダにチェックを付ける
+        let custom = (config.outputFolder ?? "").isEmpty ? nil : config.outputFolder
+        let local = item("書類フォルダ", #selector(chooseSaveLocationTapped(_:)))
         local.representedObject = "local"
-        local.state = currentTitle == "書類フォルダ" ? .on : .off
+        local.state = (onDrive || custom != nil) ? .off : .on
         sub.addItem(local)
+        if let custom = custom {
+            let path = (custom as NSString).expandingTildeInPath
+            let c = NSMenuItem(title: "指定のフォルダ", action: nil, keyEquivalent: "")
+            c.state = .on
+            c.toolTip = path
+            sub.addItem(c)
+            // 指定のフォルダが優先されるので、ドライブのアカウントのチェックは外す
+            for i in sub.items where i.representedObject is String && i !== local { i.state = .off }
+        }
         parent.submenu = sub
         return parent
     }
