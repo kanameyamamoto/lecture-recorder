@@ -26,8 +26,8 @@
 ## インストール
 
 ```
-git clone https://github.com/kanameyamamoto/LectureRecorder.git
-cd LectureRecorder
+git clone https://github.com/kanameyamamoto/lecture-recorder.git
+cd lecture-recorder
 ./build.sh
 ```
 
