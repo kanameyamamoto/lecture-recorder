@@ -31,7 +31,7 @@ cd lecture-recorder
 ./build.sh
 ```
 
-`~/Applications/LectureRecorder.app` ができて、メニューバーにマイクのアイコンが出ます。
+`~/Applications/LectureRecorder.app` ができて、メニューバーに角帽（🎓）のアイコンが出ます。録音中は塗りつぶしの角帽と経過時間に変わります。
 「Swiftのコンパイラが見つかりません」と出たら、表示される画面で Command Line Tools をインストールしてから、もう一度 `./build.sh` を実行してください。
 
 メニューの「ログイン時に起動」をオンにしておくと、毎回立ち上げる必要がありません。

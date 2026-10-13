@@ -743,15 +743,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
 
     private func updateTitle() {
         guard let button = statusItem?.button else { return }
+        // メニューバーのアイコンは角帽（講義用だと分かるように）。色はメニューバーに合わせる
+        button.imagePosition = .imageLeading
         if let meta = recordingMeta {
-            button.title = "● \(elapsed(since: meta.start))"
-            button.image = nil
+            button.image = NSImage(systemSymbolName: "graduationcap.fill", accessibilityDescription: "講義を録音中")
+            button.title = " \(elapsed(since: meta.start))"
         } else if processing != nil {
-            button.title = "文字起こし中…"
-            button.image = nil
+            button.image = NSImage(systemSymbolName: "graduationcap", accessibilityDescription: "文字起こし中")
+            button.title = " 文字起こし中…"
         } else {
+            button.image = NSImage(systemSymbolName: "graduationcap", accessibilityDescription: "LectureRecorder")
             button.title = ""
-            button.image = NSImage(systemSymbolName: "mic", accessibilityDescription: "LectureRecorder")
         }
     }
 
