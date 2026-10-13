@@ -741,18 +741,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
                          : String(format: "%d:%02d", s / 60, s % 60)
     }
 
+    /// メニューバー用の角帽アイコン（少し小さめ）
+    private func capIcon(filled: Bool, label: String) -> NSImage? {
+        let config = NSImage.SymbolConfiguration(pointSize: 14, weight: .regular, scale: .small)
+        let image = NSImage(systemSymbolName: filled ? "graduationcap.fill" : "graduationcap",
+                            accessibilityDescription: label)?.withSymbolConfiguration(config)
+        image?.isTemplate = true
+        return image
+    }
+
     private func updateTitle() {
         guard let button = statusItem?.button else { return }
         // メニューバーのアイコンは角帽（講義用だと分かるように）。色はメニューバーに合わせる
         button.imagePosition = .imageLeading
         if let meta = recordingMeta {
-            button.image = NSImage(systemSymbolName: "graduationcap.fill", accessibilityDescription: "講義を録音中")
+            button.image = capIcon(filled: true, label: "講義を録音中")
             button.title = " \(elapsed(since: meta.start))"
         } else if processing != nil {
-            button.image = NSImage(systemSymbolName: "graduationcap", accessibilityDescription: "文字起こし中")
+            button.image = capIcon(filled: false, label: "文字起こし中")
             button.title = " 文字起こし中…"
         } else {
-            button.image = NSImage(systemSymbolName: "graduationcap", accessibilityDescription: "LectureRecorder")
+            button.image = capIcon(filled: false, label: "LectureRecorder")
             button.title = ""
         }
     }
