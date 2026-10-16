@@ -29,6 +29,12 @@ final class StartPanelModel: ObservableObject {
     @Published var period: Int
     @Published var number: Int
 
+    // 話す言語と字幕（授業ごとに前回の設定を覚える）
+    @Published var language: String
+    @Published var captionsOn: Bool
+    @Published var captionTranslate: Bool
+    @Published var captureSystem: Bool
+
     let editingStart: Date?            // 録音中の情報を変更するときは、その録音の開始時刻
 
     init(config: Config, mode: StartMode, defaultName: String?, defaultPeriod: Int?,
@@ -50,6 +56,17 @@ final class StartPanelModel: ObservableObject {
         selectedName = name
         period = defaultPeriod.flatMap { options.contains($0) ? $0 : nil } ?? options.first ?? 1
         number = initialNumber ?? Attendance.nextNumber(bucket: Attendance.bucket(for: name), name: name)
+        let o = LiveCaptionOptions.load(for: name)
+        language = o.language
+        captionsOn = o.enabled
+        captionTranslate = o.translate
+        captureSystem = o.captureSystem
+    }
+
+    /// 画面で選んだ言語・字幕の設定
+    var captionOptions: LiveCaptionOptions {
+        LiveCaptionOptions(enabled: captionsOn, language: language, translate: captionTranslate,
+                           captureSystem: captureSystem)
     }
 
     var isEditing: Bool { editingStart != nil }
@@ -88,6 +105,11 @@ final class StartPanelModel: ObservableObject {
     private func resetForSelectedName() {
         period = periodOptions.first ?? 1
         number = Attendance.nextNumber(bucket: Attendance.bucket(for: selectedName), name: selectedName)
+        let o = LiveCaptionOptions.load(for: selectedName)
+        language = o.language
+        captionsOn = o.enabled
+        captionTranslate = o.translate
+        captureSystem = o.captureSystem
     }
 
     /// 今日のこのコマ（フリー録音は今日）がすでに記録されているか
@@ -162,21 +184,57 @@ struct StartPanelView: View {
                             .labelsHidden()
                             .fixedSize()
                         }
-                    }
-                    row("回数") {
-                        HStack(spacing: 8) {
-                            Text("#\(model.number)").font(.title3.bold()).monospacedDigit()
-                            Stepper("", value: $model.number, in: 1...99).labelsHidden()
-                            Text("前回＋1が自動で入ります").font(.caption).foregroundStyle(.secondary)
+                        // フリー録音は回数・出席を数えない
+                        row("回数") {
+                            HStack(spacing: 8) {
+                                Text("#\(model.number)").font(.title3.bold()).monospacedDigit()
+                                Stepper("", value: $model.number, in: 1...99).labelsHidden()
+                                Text("前回＋1が自動で入ります").font(.caption).foregroundStyle(.secondary)
+                            }
+                        }
+                        row("出席") {
+                            HStack(spacing: 6) {
+                                Text("\(model.previousAttendance) + 1").font(.title3.bold()).monospacedDigit()
+                                Text("前回までの出席 ＋ 今回").font(.caption).foregroundStyle(.secondary)
+                                if model.alreadyRecorded {
+                                    Text("（今日の分は記録済み）").font(.caption).foregroundStyle(.secondary)
+                                }
+                            }
                         }
                     }
-                    row("出席") {
-                        HStack(spacing: 6) {
-                            Text("\(model.previousAttendance) + 1").font(.title3.bold()).monospacedDigit()
-                            Text("前回までの出席 ＋ 今回").font(.caption).foregroundStyle(.secondary)
-                            if model.alreadyRecorded {
-                                Text("（今日の分は記録済み）").font(.caption).foregroundStyle(.secondary)
+                    if !model.isEditing {
+                        Divider()
+                        row("言語") {
+                            Picker("", selection: $model.language) {
+                                Text("日本語").tag(LiveCaptionOptions.japanese)
+                                Text("英語").tag(LiveCaptionOptions.english)
+                                Text("日本語と英語").tag(LiveCaptionOptions.mixed)
                             }
+                            .pickerStyle(.segmented)
+                            .labelsHidden()
+                            .fixedSize()
+                        }
+                        row("場所") {
+                            Picker("", selection: $model.captureSystem) {
+                                Text("教室").tag(false)
+                                Text("オンライン").tag(true)
+                            }
+                            .pickerStyle(.segmented)
+                            .labelsHidden()
+                            .fixedSize()
+                            .disabled(!SystemAudioCapture.isSupported)
+                        }
+                        row("字幕") {
+                            Picker("", selection: captionMode) {
+                                Text("オフ").tag(0)
+                                Text("オン").tag(1)
+                                // 「英訳つき」は全角スペースで「日本語訳つき」と同じ6文字分にして、幅が変わらないようにする
+                                Text(model.language == LiveCaptionOptions.english ? "日本語訳つき" : "\u{3000}英訳つき\u{3000}").tag(2)
+                            }
+                            .pickerStyle(.segmented)
+                            .labelsHidden()
+                            .fixedSize()
+                            .id(model.language)   // 訳の名前が変わったら作り直す（幅がずれて崩れないように）
                         }
                     }
                 }
@@ -216,6 +274,17 @@ struct StartPanelView: View {
         } message: {
             Text("録音中の音声は削除され、文字起こしも出席の記録もされません。元に戻せません。")
         }
+    }
+
+    /// 字幕：0 = オフ、1 = オン、2 = 訳つき（訳はこのMacで使えなければオンと同じ）
+    private var captionMode: Binding<Int> {
+        Binding(
+            get: { !model.captionsOn ? 0 : (model.captionTranslate && LiveCaptionOptions.translationAvailable ? 2 : 1) },
+            set: { v in
+                model.captionsOn = v > 0
+                model.captionTranslate = v == 2
+            }
+        )
     }
 
     /// 左にラベル、右に値。値はすべて同じ位置から左揃えで並べる
@@ -276,7 +345,6 @@ final class HistoryModel: ObservableObject {
         let loaded = Attendance.load()
         var list = config.semesters.map { $0.name }
         for key in loaded.keys.sorted() where key != Attendance.commonBucket && !list.contains(key) { list.append(key) }
-        list.append(Attendance.commonBucket)
         buckets = list
         selectedBucket = config.currentSemester
         reload()

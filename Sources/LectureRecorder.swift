@@ -259,7 +259,6 @@ enum Attendance {
     static func ensureFile(classNames: [String]) {
         var book = load()
         for n in classNames where book[currentSemester]?[n] == nil { book[currentSemester, default: [:]][n] = [] }
-        for n in commonNames where book[commonBucket]?[n] == nil { book[commonBucket, default: [:]][n] = [] }
         save(book)
     }
 
@@ -284,6 +283,8 @@ struct RecordingMeta: Codable {
     var bucket: String?     // 出席を数える区分（学期名、または「フリー録音」）
     var start: Date
     var end: Date?
+    var language: String? = nil   // 話す言語（"ja-JP" / "en-US" / "mixed"）。なければ日本語
+    var systemAudio: Bool? = nil  // Macの音も録った（オンライン授業）
 
     /// 録音フォルダ（.rec）なら中の meta.json、以前の1ファイル形式（.m4a）なら隣の .json
     static func url(for audio: URL) -> URL {
@@ -314,50 +315,70 @@ enum TranscribeError: LocalizedError {
     var errorDescription: String? {
         switch self {
         case .notAuthorized: return "音声認識が許可されていません（システム設定 → プライバシーとセキュリティ → 音声認識）"
-        case .unavailable: return "日本語の音声認識が使えません"
+        case .unavailable: return "音声認識が使えません（言語のデータがないなど）"
         case .allChunksFailed: return "音声を認識できませんでした"
         }
     }
 }
 
 enum Transcriber {
-    static func transcribe(url: URL) async throws -> String {
+    /// 録音ファイルを文字起こしする。日英混在なら日本語と英語の両方で認識し、区間ごとに確からしい方を選ぶ
+    static func transcribe(url: URL, language: String) async throws -> [TranscriptPiece] {
+        if language == LiveCaptionOptions.mixed {
+            #if compiler(>=6.2)
+            if #available(macOS 26.0, *) {
+                do {
+                    let ja = try await transcribeModern(url: url, language: LiveCaptionOptions.japanese)
+                    let en = (try? await transcribeModern(url: url, language: LiveCaptionOptions.english)) ?? []
+                    return LanguageMerger.merge(ja, en)
+                } catch {
+                    NSLog("SpeechAnalyzer failed, falling back: \(error)")
+                }
+            }
+            #endif
+            return try await transcribe(url: url, language: LiveCaptionOptions.japanese)
+        }
         #if compiler(>=6.2)
         if #available(macOS 26.0, *) {
             do {
-                return try await transcribeModern(url: url)
+                return try await transcribeModern(url: url, language: language)
             } catch {
                 NSLog("SpeechAnalyzer failed, falling back: \(error)")
             }
         }
         #endif
-        return try await transcribeLegacy(url: url)
+        return try await transcribeLegacy(url: url, language: language)
     }
 
     #if compiler(>=6.2)
     /// macOS 26 以降：長い音声向けの新しい音声認識（Mac内で完結）
     @available(macOS 26.0, *)
-    static func transcribeModern(url: URL) async throws -> String {
-        guard let locale = await SpeechTranscriber.supportedLocale(equivalentTo: Locale(identifier: "ja-JP")) else {
+    static func transcribeModern(url: URL, language: String) async throws -> [TranscriptPiece] {
+        guard let locale = await SpeechTranscriber.supportedLocale(equivalentTo: Locale(identifier: language)) else {
             throw TranscribeError.unavailable
         }
         let transcriber = SpeechTranscriber(locale: locale,
                                             transcriptionOptions: [],
                                             reportingOptions: [],
-                                            attributeOptions: [])
+                                            attributeOptions: [.audioTimeRange, .transcriptionConfidence])
         if let request = try await AssetInventory.assetInstallationRequest(supporting: [transcriber]) {
-            try await request.downloadAndInstall()   // 初回だけ日本語モデルをダウンロード
+            try await request.downloadAndInstall()   // 初回だけ言語モデルをダウンロード
         }
         let analyzer = SpeechAnalyzer(modules: [transcriber])
         let audioFile = try AVAudioFile(forReading: url)
 
-        let collector = Task { () throws -> String in
-            var parts: [String] = []
+        let collector = Task { () throws -> [TranscriptPiece] in
+            var pieces: [TranscriptPiece] = []
             for try await result in transcriber.results {
                 let text = String(result.text.characters).trimmingCharacters(in: .whitespacesAndNewlines)
-                if !text.isEmpty { parts.append(text) }
+                guard !text.isEmpty else { continue }
+                let s = result.range.start.seconds
+                let e = result.range.end.seconds
+                let start = s.isFinite ? s : (pieces.last?.end ?? 0)
+                pieces.append(TranscriptPiece(time: start, end: max(start, e.isFinite ? e : start), text: text,
+                                              confidence: transcriptionConfidence(of: result.text), lang: language))
             }
-            return parts.joined(separator: "\n")
+            return pieces
         }
 
         if let last = try await analyzer.analyzeSequence(from: audioFile) {
@@ -370,12 +391,12 @@ enum Transcriber {
     #endif
 
     /// macOS 25 以前：55秒ずつに区切って音声認識
-    static func transcribeLegacy(url: URL) async throws -> String {
+    static func transcribeLegacy(url: URL, language: String) async throws -> [TranscriptPiece] {
         let status = await withCheckedContinuation { (c: CheckedContinuation<SFSpeechRecognizerAuthorizationStatus, Never>) in
             SFSpeechRecognizer.requestAuthorization { c.resume(returning: $0) }
         }
         guard status == .authorized else { throw TranscribeError.notAuthorized }
-        guard let recognizer = SFSpeechRecognizer(locale: Locale(identifier: "ja-JP")), recognizer.isAvailable else {
+        guard let recognizer = SFSpeechRecognizer(locale: Locale(identifier: language)), recognizer.isAvailable else {
             throw TranscribeError.unavailable
         }
 
@@ -387,7 +408,7 @@ enum Transcriber {
         try fm.createDirectory(at: tmp, withIntermediateDirectories: true)
         defer { try? fm.removeItem(at: tmp) }
 
-        var texts: [String] = []
+        var pieces: [TranscriptPiece] = []
         var failures = 0
         var index = 0
         while input.framePosition < input.length {
@@ -398,14 +419,17 @@ enum Transcriber {
             let chunkURL = tmp.appendingPathComponent("chunk\(index).caf")
             try writeChunk(buffer, format: format, to: chunkURL)
             if let text = await recognize(recognizer, url: chunkURL) {
-                if !text.isEmpty { texts.append(text) }
+                if !text.isEmpty {
+                    let start = Double(index) * 55
+                    pieces.append(TranscriptPiece(time: start, end: start + 55, text: text, confidence: nil, lang: language))
+                }
             } else {
                 failures += 1
             }
             index += 1
         }
         if index > 0 && failures == index { throw TranscribeError.allChunksFailed }
-        return texts.joined(separator: "\n")
+        return pieces
     }
 
     private static func writeChunk(_ buffer: AVAudioPCMBuffer, format: AVAudioFormat, to url: URL) throws {
@@ -449,6 +473,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
     private var terminateSignal: DispatchSourceSignal?
     private var startPanel: NSPanel?
     private var historyWindow: NSWindow?
+    private var recordingsWindow: NSWindow?
+    private var recordingsModel: RecordingHistoryModel?
     private var config = Config.default
 
     private var recorder: AVAudioRecorder?
@@ -459,9 +485,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
     private var segmentTimer: Timer?
     private var partIndex = 0
 
+    // 録音しながらの文字起こしと字幕
+    private var liveSession: LiveSession?
+    private var captionPanel: NSPanel?
+    private var systemCapture: SystemAudioCapture?   // Macの音（オンライン授業）
+    private let captureQueue = DispatchQueue(label: "lecturerecorder.capture", qos: .userInitiated)
+
     private var queue: [URL] = []
     private var processing: URL?
     private var lastError: String?
+    private var failedAttempts: [URL: Int] = [:]   // 文字起こしに失敗した回数（この起動の間）
+    private var finishing: Set<URL> = []           // 録音を止めて、仕上げを待っている録音
+    private var retryTimer: Timer?
 
     // MARK: 起動
 
@@ -491,12 +526,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
         terminateSignal = source
 
         // 前回、文字起こし前に終了してしまった録音があれば処理する
-        let leftovers = pendingAudioFiles()
-        for audio in leftovers { enqueue(audio) }
+        RecordingLog.sync(pending: pendingAudioFiles())
+        backfillRecordings()
+        retryPendingAutomatically()
+        // 失敗した録音は、録音していないときに30分ごとにもう一度試す（起動ごとに2回まで）
+        retryTimer = Timer.scheduledTimer(withTimeInterval: 1800, repeats: true) { [weak self] _ in
+            Task { @MainActor in self?.retryPendingAutomatically() }
+        }
     }
 
     /// 終了の合図を受けたら、録音中なら保存してから終了する（文字起こしは次の起動時）
     private func handleTerminateSignal() {
+        stopSystemCaptureNow()
         if recorder != nil { stopRecording(process: false) }
         exit(0)
     }
@@ -510,6 +551,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
             alert.addButton(withTitle: "終了する")
             NSApp.activate(ignoringOtherApps: true)
             if alert.runModal() == .alertFirstButtonReturn { return .terminateCancel }
+            stopSystemCaptureNow()
             if recorder != nil { stopRecording(process: false) }
         }
         return .terminateNow
@@ -639,19 +681,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
         if recordingMeta != nil {
             menu.addItem(item("■ 録音を終了して文字起こし", #selector(stopTapped)))
 
+            if liveSession != nil {
+                let captionsVisible = captionPanel?.isVisible ?? false
+                menu.addItem(item(captionsVisible ? "字幕を隠す" : "字幕を表示", #selector(toggleCaptionsTapped)))
+            }
             menu.addItem(item("録音中の情報を変更…", #selector(openEditPanelTapped)))
         } else {
             menu.addItem(item("● 講義の録音を開始…", #selector(openStartPanelTapped)))
             menu.addItem(item("● フリー録音を開始…", #selector(openOtherStartPanelTapped)))
         }
 
-        let pending = pendingAudioFiles().filter { $0 != recordingAudio && $0 != processing && !queue.contains($0) }
-        if !pending.isEmpty {
-            menu.addItem(item("未完了の録音を文字起こし（\(pending.count)件）", #selector(retryTapped)))
-        }
-
         // 画面を開くもの
         menu.addItem(.separator())
+        // 文字起こしでエラーが起きた録音があれば、そのことを録音履歴の横に出す
+        let hasError = RecordingLog.load().contains {
+            $0.status == .failed || $0.status == .broken || ($0.status == .waiting && $0.failures > 0)
+        }
+        menu.addItem(item(hasError ? "録音履歴…（エラー）" : "録音履歴…", #selector(openRecordingsTapped)))
         menu.addItem(item("出席履歴…", #selector(openHistoryTapped)))
         menu.addItem(item("時間割を編集…", #selector(editTimetableTapped)))
 
@@ -726,7 +772,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
 
     private func statusText() -> String {
         if let meta = recordingMeta {
-            return "録音中：\(meta.name) #\(meta.number ?? 1)（\(elapsed(since: meta.start))）"
+            let number = meta.kind == "講義" ? " #\(meta.number ?? 1)" : ""
+            return "録音中：\(meta.name)\(number)（\(elapsed(since: meta.start))）"
         }
         if let p = processing, let meta = try? RecordingMeta.load(for: p) {
             let more = queue.isEmpty ? "" : "／ほか\(queue.count)件待ち"
@@ -787,6 +834,127 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
         stopRecording(process: false, countAttendance: false)
         try? FileManager.default.removeItem(at: audio)
         try? FileManager.default.removeItem(at: RecordingMeta.url(for: audio))
+        RecordingLog.remove(id: audio.lastPathComponent)
+        refreshRecordings()
+    }
+
+    private static let maxAutoAttempts = 2    // 1回の起動のあいだに自動でやり直す回数
+    private static let maxTotalAttempts = 5   // これだけ失敗したら、自動ではもう試さない
+
+    /// 文字起こしが終わっていない録音を自動でやり直す（録音中はしない）
+    private func retryPendingAutomatically() {
+        guard recorder == nil else { return }
+        let records = RecordingLog.load()
+        for audio in pendingAudioFiles()
+        where audio != recordingAudio && audio != processing && !queue.contains(audio)
+            && !finishing.contains(audio) && failedAttempts[audio, default: 0] < Self.maxAutoAttempts {
+            if let r = records.first(where: { $0.id == audio.lastPathComponent }), r.status == .failed { continue }
+            enqueue(audio)
+        }
+    }
+
+    // MARK: 録音履歴
+
+    @objc private func openRecordingsTapped() {
+        if let w = recordingsWindow {
+            recordingsModel?.reload()
+            NSApp.activate(ignoringOtherApps: true)
+            w.makeKeyAndOrderFront(nil)
+            return
+        }
+        let model = RecordingHistoryModel(
+            retry: { [weak self] r in self?.retryRecording(r) },
+            delete: { [weak self] r in self?.deleteRecording(r) }
+        )
+        let w = NSWindow(contentViewController: NSHostingController(rootView: RecordingHistoryView(model: model)))
+        w.title = "録音履歴"
+        w.styleMask = [.titled, .closable, .resizable]
+        w.isReleasedWhenClosed = false
+        w.delegate = self
+        recordingsModel = model
+        recordingsWindow = w
+        present(w)
+    }
+
+    private func refreshRecordings() {
+        recordingsModel?.reload()
+    }
+
+    /// 履歴を作る前からある録音（文字起こし済み・壊れていたもの）も履歴に入れる
+    private func backfillRecordings() {
+        var records = RecordingLog.load()
+        let known = Set(records.map(\.id))
+        let fm = FileManager.default
+        let inbox = outputRoot()?.appendingPathComponent("Inbox", isDirectory: true)
+        for (dir, status) in [(Paths.audioDone, RecordingRecord.Status.done), (Paths.audioBroken, RecordingRecord.Status.broken)] {
+            let items = (try? fm.contentsOfDirectory(at: dir, includingPropertiesForKeys: nil)) ?? []
+            for audio in items where (audio.pathExtension == "rec" || audio.pathExtension == "m4a")
+                && !known.contains(audio.lastPathComponent) {
+                guard let meta = try? RecordingMeta.load(for: audio) else { continue }
+                var r = RecordingRecord(id: audio.lastPathComponent, meta: meta, status: status)
+                if status == .done, let inbox {
+                    // Inbox か、まとめ終わって移された Done にあるはず（どちらも Inbox の場所で覚えておく）
+                    r.transcript = inbox.appendingPathComponent(fileBase(start: meta.start, name: meta.name) + ".txt").path
+                }
+                if status == .broken { r.lastError = "音声ファイルが壊れていて読み込めませんでした" }
+                records.append(r)
+            }
+        }
+        // 以前の版で、文字起こしの場所を覚えずに入れた記録を直す
+        if let inbox {
+            for i in records.indices where records[i].status == .done && records[i].transcript == nil {
+                records[i].transcript = inbox.appendingPathComponent(fileBase(start: records[i].start, name: records[i].name) + ".txt").path
+            }
+        }
+        RecordingLog.save(records)
+    }
+
+    /// 履歴から、もう一度文字起こしする（完了したものは音声を戻してから）
+    private func retryRecording(_ r: RecordingRecord) {
+        guard var audio = r.audioURL, audio != processing, audio != recordingAudio else { return }
+        let fm = FileManager.default
+        if audio.deletingLastPathComponent().standardizedFileURL != Paths.audio.standardizedFileURL {
+            let back = Paths.audio.appendingPathComponent(audio.lastPathComponent)
+            do {
+                try fm.moveItem(at: audio, to: back)
+                if audio.pathExtension != "rec" {   // 以前の形式は、隣のメタ情報も戻す
+                    try? fm.moveItem(at: RecordingMeta.url(for: audio), to: RecordingMeta.url(for: back))
+                }
+                audio = back
+            } catch {
+                showAlert("やり直せませんでした", error.localizedDescription)
+                return
+            }
+        }
+        failedAttempts[audio] = 0
+        RecordingLog.update(audio) {
+            $0.status = .waiting
+            $0.failures = 0
+            $0.lastError = nil
+        }
+        refreshRecordings()
+        enqueue(audio)
+    }
+
+    /// 履歴から削除する（音声と履歴。保存済みの文字起こしは残す）
+    private func deleteRecording(_ r: RecordingRecord) {
+        if let audio = r.audioURL {
+            guard audio != processing, audio != recordingAudio else { return }
+            queue.removeAll { $0 == audio }
+            try? FileManager.default.removeItem(at: audio)
+            if audio.pathExtension != "rec" { try? FileManager.default.removeItem(at: RecordingMeta.url(for: audio)) }
+        }
+        RecordingLog.remove(id: r.id)
+        refreshRecordings()
+    }
+
+    /// メニューに出す録音の名前（例：データサイエンス応用 10/16）
+    private func recordingLabel(_ audio: URL) -> String {
+        guard let meta = try? RecordingMeta.load(for: audio) else { return audio.deletingPathExtension().lastPathComponent }
+        let f = DateFormatter()
+        f.locale = Locale(identifier: "ja_JP")
+        f.dateFormat = "M/d"
+        return "\(meta.name) \(f.string(from: meta.start))"
     }
 
     @objc private func retryTapped() {
@@ -861,6 +1029,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
         if w === timetableWindow { timetableWindow = nil }
         if w === startPanel { startPanel = nil }
         if w === historyWindow { historyWindow = nil }
+        if w === recordingsWindow { recordingsWindow = nil; recordingsModel = nil }
     }
 
     // MARK: 講義の録音開始（確認画面）
@@ -904,12 +1073,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
         guard var meta = recordingMeta, let audio = recordingAudio else { return }
         meta.name = name
         meta.kind = mode == .lecture ? "講義" : name
-        meta.number = number
+        meta.number = mode == .lecture ? number : nil   // フリー録音は回数を数えない
         meta.period = mode == .lecture ? period : nil
         meta.multiPeriod = mode == .lecture ? ((classEntry(named: name)?.periods?.count ?? 0) > 1) : nil
         meta.bucket = Attendance.bucket(for: name)
         recordingMeta = meta
         try? meta.save(for: audio)
+        RecordingLog.update(audio, meta: meta) { _ in }
+        refreshRecordings()
     }
 
     @objc private func openStartPanelTapped() { openStartPanel(mode: .lecture) }
@@ -928,9 +1099,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
             model: model,
             onStart: { [weak self] name, period, number in
                 guard let self = self else { return }
+                let captions = model.captionOptions
+                captions.save(for: name)
                 self.startPanel?.close()
                 self.requestMicThenRecord(kind: mode == .lecture ? "講義" : name,
-                                          name: name, number: number, period: period)
+                                          name: name, number: number, period: period,
+                                          captions: captions)
             },
             onCancel: { [weak self] in
                 self?.startPanel?.close()
@@ -1022,14 +1196,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
 
     // MARK: 録音
 
-    private func requestMicThenRecord(kind: String, name: String, number: Int? = nil, period: Int? = nil) {
+    private func requestMicThenRecord(kind: String, name: String, number: Int? = nil, period: Int? = nil,
+                                      captions: LiveCaptionOptions? = nil) {
         switch AVCaptureDevice.authorizationStatus(for: .audio) {
         case .authorized:
-            startRecording(kind: kind, name: name, number: number, period: period)
+            startRecording(kind: kind, name: name, number: number, period: period, captions: captions)
         case .notDetermined:
             AVCaptureDevice.requestAccess(for: .audio) { granted in
                 Task { @MainActor in
-                    if granted { self.startRecording(kind: kind, name: name, number: number, period: period) }
+                    if granted { self.startRecording(kind: kind, name: name, number: number, period: period, captions: captions) }
                     else { self.showMicDenied() }
                 }
             }
@@ -1057,6 +1232,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
         session.appendingPathComponent(String(format: "part%03d.m4a", index))
     }
 
+    private func systemPartURL(_ session: URL, _ index: Int) -> URL {
+        session.appendingPathComponent(String(format: "sys%03d.m4a", index))
+    }
+
     private func makeRecorder(_ url: URL) throws -> AVAudioRecorder {
         let r = try AVAudioRecorder(url: url, settings: Self.recordSettings)
         guard r.record() else {
@@ -1066,7 +1245,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
         return r
     }
 
-    private func startRecording(kind: String, name: String, number: Int? = nil, period: Int? = nil) {
+    private func startRecording(kind: String, name: String, number: Int? = nil, period: Int? = nil,
+                                captions: LiveCaptionOptions? = nil) {
         guard recorder == nil else { return }
         let start = Date()
         // 録音1回分を1つのフォルダにまとめ、その中に5分ごとのファイルを作る
@@ -1076,12 +1256,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
             let bucket = Attendance.bucket(for: name)
             let isLecture = kind == "講義"
             let meta = RecordingMeta(kind: kind, name: name,
-                                     number: number ?? Attendance.nextNumber(bucket: bucket, name: name),
+                                     number: isLecture ? (number ?? Attendance.nextNumber(bucket: bucket, name: name)) : nil,
                                      period: isLecture ? (period ?? periodForRecording(name: name)) : nil,
                                      multiPeriod: isLecture ? ((classEntry(named: name)?.periods?.count ?? 0) > 1) : nil,
                                      bucket: bucket,
-                                     start: start, end: nil)
+                                     start: start, end: nil,
+                                     language: (captions ?? LiveCaptionOptions.load(for: name)).language,
+                                     systemAudio: (captions ?? LiveCaptionOptions.load(for: name)).captureSystem
+                                        && SystemAudioCapture.isSupported ? true : nil)
             try meta.save(for: session)
+            RecordingLog.update(session, meta: meta) { $0.status = .recording }
+            refreshRecordings()
             recorder = try makeRecorder(partURL(session, 1))
             partIndex = 1
             recordingAudio = session
@@ -1096,6 +1281,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
                 Task { @MainActor in self?.rotateSegment() }
             }
             updateTitle()
+            startLive(captions ?? LiveCaptionOptions.load(for: name), folder: session, start: start)
         } catch {
             try? FileManager.default.removeItem(at: session)
             showAlert("録音を開始できませんでした", error.localizedDescription)
@@ -1111,6 +1297,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
             old.stop()
             recorder = r
             partIndex = next
+            if let cap = systemCapture {
+                let url = systemPartURL(session, next)
+                captureQueue.async { cap.rotate(to: url) }
+            }
         } catch {
             NSLog("録音の区切りに失敗（今のファイルで録音を続けます）: \(error)")
         }
@@ -1119,9 +1309,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
     private func stopRecording(process: Bool, countAttendance: Bool = true) {
         guard let r = recorder, let audio = recordingAudio, var meta = recordingMeta else { return }
         r.stop()
+        let live = liveSession
+        liveSession = nil
+        closeCaptionPanel()
         meta.end = Date()
         try? meta.save(for: audio)
-        if countAttendance {
+        RecordingLog.update(audio, meta: meta) { $0.status = .waiting }
+        refreshRecordings()
+        if countAttendance && meta.kind == "講義" {   // フリー録音は出席を数えない
             let bucket = meta.bucket ?? Attendance.bucket(for: meta.name)
             Attendance.record(bucket: bucket, name: meta.name, date: meta.start,
                               number: meta.number ?? Attendance.nextNumber(bucket: bucket, name: meta.name),
@@ -1137,7 +1332,106 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
         if let a = sleepActivity { ProcessInfo.processInfo.endActivity(a) }
         sleepActivity = nil
         updateTitle()
-        if process { enqueue(audio) }
+        // Macの音を止めて（ファイルを閉じて）から、録音中の文字起こしの最後の確定を待ち、仕上げに回す
+        let cap = systemCapture
+        systemCapture = nil
+        finishing.insert(audio)   // 仕上げ中は自動のやり直しに拾わせない
+        let finishLive: @MainActor @Sendable () -> Void = { [weak self] in
+            if let live = live {
+                live.finish {
+                    self?.finishing.remove(audio)
+                    if process { self?.enqueue(audio) }
+                }
+            } else {
+                self?.finishing.remove(audio)
+                if process { self?.enqueue(audio) }
+            }
+        }
+        if let cap = cap {
+            captureQueue.async {
+                cap.stop()
+                Task { @MainActor in finishLive() }
+            }
+        } else {
+            finishLive()
+        }
+    }
+
+    /// アプリを終了するときは、Macの音のファイルをその場で閉じる
+    private func stopSystemCaptureNow() {
+        systemCapture?.stop()
+        systemCapture = nil
+    }
+
+    // MARK: 録音しながらの文字起こしと字幕
+
+    private func startLive(_ options: LiveCaptionOptions, folder: URL, start: Date) {
+        let model = LiveCaptionModel(options: options, title: recordingMeta?.name ?? "")
+        let live = LiveSession(options: options, folder: folder, recordingStart: start, model: model)
+        liveSession = live
+        if options.enabled { showCaptionPanel() }
+
+        guard options.captureSystem, SystemAudioCapture.isSupported else {
+            Task { await live.begin(useMic: true) }
+            return
+        }
+        // オンライン授業：Macの音を録り、文字起こしもMacの音から（マイクの録音は続ける）
+        let cap = SystemAudioCapture()
+        let fanout = live.fanout
+        cap.onBuffer = { buffer in fanout.append(buffer) }
+        systemCapture = cap
+        let url = systemPartURL(folder, partIndex)
+        captureQueue.async {
+            let failure: String? = {
+                do { try cap.start(writingTo: url); return nil } catch { return error.localizedDescription }
+            }()
+            Task { @MainActor [weak self] in
+                guard let self = self else { return }
+                if let failure = failure {
+                    Log.write("Macの音を録れませんでした: \(failure)")
+                    if self.systemCapture === cap { self.systemCapture = nil }
+                    self.updateMeta { $0.systemAudio = false }
+                    self.notify("Macの音を録れませんでした",
+                                "マイクだけで録音を続けます。システム設定 → プライバシーとセキュリティ →「画面収録とシステムオーディオ録音」で LectureRecorder をオンにしてください。")
+                    await live.begin(useMic: true)
+                } else {
+                    Log.write("Macの音の録音を開始")
+                    await live.begin(useMic: false)
+                }
+            }
+        }
+    }
+
+    /// 録音中のメタ情報を変えて保存する
+    private func updateMeta(_ change: (inout RecordingMeta) -> Void) {
+        guard var meta = recordingMeta, let audio = recordingAudio else { return }
+        change(&meta)
+        recordingMeta = meta
+        try? meta.save(for: audio)
+    }
+
+    private func showCaptionPanel() {
+        guard let model = liveSession?.model else { return }
+        if captionPanel == nil {
+            captionPanel = LiveCaptionPanel.make(model: model) { [weak self] in
+                self?.captionPanel?.orderOut(nil)   // 閉じずに隠すだけ（文字起こしは続く）
+            }
+        }
+        captionPanel?.orderFrontRegardless()
+    }
+
+    private func closeCaptionPanel() {
+        captionPanel?.orderOut(nil)
+        captionPanel?.close()
+        captionPanel = nil
+    }
+
+    @objc private func toggleCaptionsTapped() {
+        if let panel = captionPanel, panel.isVisible {
+            panel.orderOut(nil)
+        } else {
+            showCaptionPanel()
+        }
     }
 
     private func fileBase(start: Date, name: String) -> String {
@@ -1157,7 +1451,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
     }
 
     private func enqueue(_ audio: URL) {
-        guard audio != processing, !queue.contains(audio) else { return }
+        guard audio != processing, !queue.contains(audio),
+              FileManager.default.fileExists(atPath: audio.path) else { return }
         queue.append(audio)
         if processing == nil { processNext() }
     }
@@ -1166,11 +1461,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
         guard !queue.isEmpty else {
             processing = nil
             updateTitle()
+            refreshRecordings()
+            retryPendingAutomatically()   // 失敗したものがあれば、もう一度だけ試す
             return
         }
         let audio = queue.removeFirst()
         processing = audio
         updateTitle()
+        RecordingLog.update(audio) { $0.status = .transcribing }
+        refreshRecordings()
 
         Task {
             var recordingName: String?
@@ -1179,47 +1478,90 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
                 recordingName = meta.name
                 if meta.end == nil {   // 途中で終了した録音
                     meta.end = self.latestModification(of: audio) ?? meta.start
-                    let bucket = meta.bucket ?? Attendance.bucket(for: meta.name)
-                    if meta.number == nil { meta.number = Attendance.nextNumber(bucket: bucket, name: meta.name) }
-                    Attendance.record(bucket: bucket, name: meta.name, date: meta.start,
-                                      number: meta.number ?? 1, period: meta.period)
+                    if meta.kind == "講義" {   // フリー録音は出席を数えない
+                        let bucket = meta.bucket ?? Attendance.bucket(for: meta.name)
+                        if meta.number == nil { meta.number = Attendance.nextNumber(bucket: bucket, name: meta.name) }
+                        Attendance.record(bucket: bucket, name: meta.name, date: meta.start,
+                                          number: meta.number ?? 1, period: meta.period)
+                    }
                 }
                 // 5分ごとのファイルのうち、読めるものだけを順番に文字起こしする
                 // （電源が急に落ちたときなど、最後のファイルが壊れていることがある）
-                let parts = self.audioParts(of: audio)
+                // Macの音を録った録音（オンライン授業）は、そちらを文字起こしする
+                let systemParts = meta.systemAudio == true ? self.systemAudioParts(of: audio) : []
+                let parts = systemParts.isEmpty ? self.audioParts(of: audio) : systemParts
                 let readable = parts.filter { (try? AVAudioFile(forReading: $0)) != nil }
                 if readable.isEmpty {
+                    RecordingLog.update(audio, meta: meta) {
+                        $0.status = .broken
+                        $0.lastError = "音声ファイルが壊れていて読み込めませんでした"
+                    }
                     self.moveToBroken(audio)
-                    self.lastError = "録音が壊れていました：\(meta.name)"
                     self.notify("録音を読み込めませんでした：\(meta.name)",
                                 "録音中にアプリが強制終了されたなどの理由で、音声ファイルが壊れていました。")
                     self.processNext()
                     return
                 }
-                var texts: [String] = []
-                for part in readable {
-                    let t = try await Transcriber.transcribe(url: part)
-                    if !t.isEmpty { texts.append(t) }
+                let duration = (meta.end ?? meta.start).timeIntervalSince(meta.start)
+                var text: String
+                var method = "録音中に文字起こし"
+                if audio.pathExtension == "rec",
+                   let live = LiveSession.usableTranscript(in: audio, duration: duration) {
+                    // 録音しながらの文字起こしが最後まで続いていれば、それをそのまま使う
+                    text = live
+                    Log.write("録音中の文字起こしを使用：\(meta.name)")
+                } else {
+                    // なければ録音ファイルから文字起こしする（5分ごとのファイルの時間をつなげる）
+                    Log.write("録音ファイルから文字起こし：\(meta.name)")
+                    method = "録音ファイルから文字起こし"
+                    var lines: [String] = []
+                    var offset: TimeInterval = 0
+                    for part in readable {
+                        let pieces = try await Transcriber.transcribe(url: part, language: meta.language ?? LiveCaptionOptions.japanese)
+                        lines += pieces.map { $0.line(offset: offset) }
+                        if let f = try? AVAudioFile(forReading: part), f.fileFormat.sampleRate > 0 {
+                            offset += Double(f.length) / f.fileFormat.sampleRate
+                        } else {
+                            offset += Self.segmentSeconds
+                        }
+                    }
+                    text = lines.joined(separator: "\n")
+                    if readable.count < parts.count {
+                        text += "\n\n（録音の一部（約\((parts.count - readable.count) * 5)分）を読み込めなかったため、その部分は含まれていません）"
+                    }
                 }
-                var text = texts.joined(separator: "\n")
-                if readable.count < parts.count {
-                    text += "\n\n（録音の一部（約\((parts.count - readable.count) * 5)分）を読み込めなかったため、その部分は含まれていません）"
-                }
-                try self.writeTranscript(meta: meta, text: text, audio: audio)
+                let saved = try self.writeTranscript(meta: meta, text: text, audio: audio)
                 self.moveToDone(audio)
+                RecordingLog.update(audio, meta: meta) {
+                    $0.status = .done
+                    $0.transcript = saved.path
+                    $0.method = method
+                    $0.lastError = nil
+                }
                 self.lastError = nil
                 self.notify("文字起こし完了：\(meta.name)",
                             "保存先フォルダに保存しました。")
             } catch {
-                self.lastError = recordingName.map { "文字起こしに失敗しました：\($0)" } ?? "文字起こしに失敗しました"
-                self.notify("文字起こしに失敗しました",
-                            "\(error.localizedDescription)\nメニューの「未完了の録音を文字起こし」で再試行できます。")
+                self.failedAttempts[audio, default: 0] += 1
+                var gaveUp = false
+                RecordingLog.update(audio) {
+                    $0.failures += 1
+                    $0.lastError = error.localizedDescription
+                    gaveUp = $0.failures >= Self.maxTotalAttempts
+                    $0.status = gaveUp ? .failed : .waiting
+                }
+                if gaveUp {
+                    self.notify("文字起こしできませんでした：\(recordingName ?? "録音")",
+                                "\(Self.maxTotalAttempts)回試してもできなかったので、自動でやり直すのをやめました。メニューの「録音履歴」から確認できます。")
+                }
             }
+            self.refreshRecordings()
             self.processNext()
         }
     }
 
-    private func writeTranscript(meta: RecordingMeta, text: String, audio: URL) throws {
+    @discardableResult
+    private func writeTranscript(meta: RecordingMeta, text: String, audio: URL) throws -> URL {
         guard let root = outputRoot() else {
             throw NSError(domain: "LectureRecorder", code: 2,
                           userInfo: [NSLocalizedDescriptionKey: "Googleドライブが見つかりません"])
@@ -1237,15 +1579,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
         let mins = max(1, Int(end.timeIntervalSince(meta.start) / 60))
 
         let body = text.isEmpty ? "（音声を認識できませんでした）" : text
-        let number = meta.number.map { "#\($0)" } ?? "不明"
+        let numberLine = meta.number.map { "回数: #\($0)\n" } ?? ""   // フリー録音は回数なし
         let periodLine = meta.period.map { "時限: \($0)限\(meta.multiPeriod == true ? "（2コマ続き）" : "")\n" } ?? ""
         let semesterLine = (meta.kind == "講義" && meta.bucket != nil) ? "学期: \(meta.bucket!)\n" : ""
         let content = """
         ---
         種別: \(meta.kind)
         \(semesterLine)授業: \(meta.name)
-        回数: \(number)
-        \(periodLine)日付: \(d.string(from: meta.start))（\(todaySymbol(meta.start))）
+        \(numberLine)\(periodLine)日付: \(d.string(from: meta.start))（\(todaySymbol(meta.start))）
         録音: \(t.string(from: meta.start))〜\(t.string(from: end))（\(mins)分）
         ---
 
@@ -1254,6 +1595,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
         """
         let file = folder.appendingPathComponent(fileBase(start: meta.start, name: meta.name) + ".txt")
         try content.write(to: file, atomically: true, encoding: .utf8)
+        return file
     }
 
     private func moveToDone(_ audio: URL) {
@@ -1271,7 +1613,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
     private func audioParts(of audio: URL) -> [URL] {
         guard audio.pathExtension == "rec" else { return [audio] }
         let items = (try? FileManager.default.contentsOfDirectory(at: audio, includingPropertiesForKeys: nil)) ?? []
-        return items.filter { $0.pathExtension == "m4a" }.sorted { $0.lastPathComponent < $1.lastPathComponent }
+        return items.filter { $0.pathExtension == "m4a" && !$0.lastPathComponent.hasPrefix("sys") }
+            .sorted { $0.lastPathComponent < $1.lastPathComponent }
+    }
+
+    /// Macの音を録ったファイル（オンライン授業）
+    private func systemAudioParts(of audio: URL) -> [URL] {
+        guard audio.pathExtension == "rec" else { return [] }
+        let items = (try? FileManager.default.contentsOfDirectory(at: audio, includingPropertiesForKeys: nil)) ?? []
+        return items.filter { $0.pathExtension == "m4a" && $0.lastPathComponent.hasPrefix("sys") }
+            .sorted { $0.lastPathComponent < $1.lastPathComponent }
     }
 
     /// 録音の最後のファイルの更新時刻（＝録音が終わったおおよその時刻）
