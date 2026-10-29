@@ -16,6 +16,7 @@ struct RecordingRecord: Codable, Identifiable, Equatable {
         case done           // 完了
         case failed         // 何度やってもできなかった（自動ではもう試さない）
         case broken         // 音声が壊れていた
+        case stopped        // 自分で止めた（自動ではやり直さない）
     }
 
     var id: String            // 録音フォルダの名前
@@ -141,10 +142,13 @@ final class RecordingHistoryModel: ObservableObject {
     @Published private(set) var records: [RecordingRecord] = []
 
     let retry: (RecordingRecord) -> Void
+    let stop: (RecordingRecord) -> Void
     let delete: (RecordingRecord) -> Void
 
-    init(retry: @escaping (RecordingRecord) -> Void, delete: @escaping (RecordingRecord) -> Void) {
+    init(retry: @escaping (RecordingRecord) -> Void, stop: @escaping (RecordingRecord) -> Void,
+         delete: @escaping (RecordingRecord) -> Void) {
         self.retry = retry
+        self.stop = stop
         self.delete = delete
         reload()
     }
@@ -207,9 +211,13 @@ struct RecordingHistoryView: View {
                 if let a = r.audioURL {
                     Button { NSWorkspace.shared.activateFileViewerSelecting([a]) } label: { Image(systemName: "folder") }
                         .help("音声をFinderで表示")
-                    if [.done, .failed, .waiting].contains(r.status) {
+                    if r.status == .transcribing || r.status == .waiting {
+                        Button { model.stop(r) } label: { Image(systemName: "stop.circle") }
+                            .help("文字起こしを止める（自動でもやり直さなくなります）")
+                    }
+                    if [.done, .failed, .stopped].contains(r.status) {
                         Button { model.retry(r) } label: { Image(systemName: "arrow.clockwise") }
-                            .help("もう一度文字起こしする")
+                            .help(r.status == .stopped ? "文字起こしを再開する" : "もう一度文字起こしする")
                     }
                 }
                 if r.status != .recording && r.status != .transcribing {
@@ -252,6 +260,8 @@ struct RecordingHistoryView: View {
             Label("できませんでした", systemImage: "exclamationmark.triangle.fill").foregroundStyle(.orange)
         case .broken:
             Label("音声が壊れていた", systemImage: "xmark.octagon.fill").foregroundStyle(.red)
+        case .stopped:
+            Label("止めました", systemImage: "stop.circle").foregroundStyle(.secondary)
         }
     }
 }

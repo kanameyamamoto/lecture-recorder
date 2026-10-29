@@ -310,18 +310,55 @@ struct RecordingMeta: Codable {
 
 // MARK: - 文字起こし
 
+/// 先に終わった方だけで続きを再開する
+final class ResumeOnce<T>: @unchecked Sendable {
+    private let lock = NSLock()
+    private var continuation: CheckedContinuation<T, Error>?
+
+    func set(_ c: CheckedContinuation<T, Error>) {
+        lock.lock(); continuation = c; lock.unlock()
+    }
+
+    func resume(_ result: Result<T, Error>) {
+        lock.lock()
+        let c = continuation
+        continuation = nil
+        lock.unlock()
+        c?.resume(with: result)
+    }
+}
+
 enum TranscribeError: LocalizedError {
-    case notAuthorized, unavailable, allChunksFailed
+    case notAuthorized, unavailable, allChunksFailed, timedOut
     var errorDescription: String? {
         switch self {
         case .notAuthorized: return "音声認識が許可されていません（システム設定 → プライバシーとセキュリティ → 音声認識）"
         case .unavailable: return "音声認識が使えません（言語のデータがないなど）"
         case .allChunksFailed: return "音声を認識できませんでした"
+        case .timedOut: return "文字起こしが時間内に終わりませんでした"
         }
     }
 }
 
 enum Transcriber {
+    /// 決めた時間を過ぎたら、終わっていなくても時間切れのエラーにする
+    /// （音声認識が返ってこないまま止まると、後ろの録音がずっと文字起こしされなくなるため）
+    static func withTimeout<T: Sendable>(_ seconds: TimeInterval,
+                                         _ operation: @escaping @Sendable () async throws -> T) async throws -> T {
+        let once = ResumeOnce<T>()
+        return try await withCheckedThrowingContinuation { (c: CheckedContinuation<T, Error>) in
+            once.set(c)
+            let work = Task {
+                do { once.resume(.success(try await operation())) } catch { once.resume(.failure(error)) }
+            }
+            Task {
+                try? await Task.sleep(nanoseconds: UInt64(seconds * 1_000_000_000))
+                work.cancel()
+                once.resume(.failure(TranscribeError.timedOut))
+            }
+        }
+    }
+
     /// 録音ファイルを文字起こしする。日英混在なら日本語と英語の両方で認識し、区間ごとに確からしい方を選ぶ
     static func transcribe(url: URL, language: String) async throws -> [TranscriptPiece] {
         if language == LiveCaptionOptions.mixed {
@@ -493,6 +530,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
 
     private var queue: [URL] = []
     private var processing: URL?
+    private var processingToken: UUID?   // 今の文字起こしの合言葉（止めたあとに古い処理の結果を使わないため）
     private var lastError: String?
     private var failedAttempts: [URL: Int] = [:]   // 文字起こしに失敗した回数（この起動の間）
     private var finishing: Set<URL> = []           // 録音を止めて、仕上げを待っている録音
@@ -848,7 +886,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
         for audio in pendingAudioFiles()
         where audio != recordingAudio && audio != processing && !queue.contains(audio)
             && !finishing.contains(audio) && failedAttempts[audio, default: 0] < Self.maxAutoAttempts {
-            if let r = records.first(where: { $0.id == audio.lastPathComponent }), r.status == .failed { continue }
+            if let r = records.first(where: { $0.id == audio.lastPathComponent }),
+               r.status == .failed || r.status == .stopped { continue }
             enqueue(audio)
         }
     }
@@ -864,6 +903,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
         }
         let model = RecordingHistoryModel(
             retry: { [weak self] r in self?.retryRecording(r) },
+            stop: { [weak self] r in self?.stopTranscription(r) },
             delete: { [weak self] r in self?.deleteRecording(r) }
         )
         let w = NSWindow(contentViewController: NSHostingController(rootView: RecordingHistoryView(model: model)))
@@ -911,7 +951,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
 
     /// 履歴から、もう一度文字起こしする（完了したものは音声を戻してから）
     private func retryRecording(_ r: RecordingRecord) {
-        guard var audio = r.audioURL, audio != processing, audio != recordingAudio else { return }
+        guard var audio = r.audioURL, !isBusy(r) else { return }
         let fm = FileManager.default
         if audio.deletingLastPathComponent().standardizedFileURL != Paths.audio.standardizedFileURL {
             let back = Paths.audio.appendingPathComponent(audio.lastPathComponent)
@@ -936,11 +976,32 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
         enqueue(audio)
     }
 
+    /// 録音中・文字起こし中の録音か
+    private func isBusy(_ r: RecordingRecord) -> Bool {
+        processing?.lastPathComponent == r.id || recordingAudio?.lastPathComponent == r.id
+    }
+
+    /// 履歴から、文字起こしを止める（自動でもやり直さない。↻で再開できる）
+    private func stopTranscription(_ r: RecordingRecord) {
+        queue.removeAll { $0.lastPathComponent == r.id }
+        if let audio = r.audioURL {
+            RecordingLog.update(audio) { $0.status = .stopped }
+        }
+        Log.write("文字起こしを止めました：\(r.name)")
+        if processing?.lastPathComponent == r.id {
+            processingToken = nil   // 今動いている処理の結果は使わない
+            processing = nil
+            updateTitle()
+            processNext()           // 待っている次の録音へ
+        }
+        refreshRecordings()
+    }
+
     /// 履歴から削除する（音声と履歴。保存済みの文字起こしは残す）
     private func deleteRecording(_ r: RecordingRecord) {
         if let audio = r.audioURL {
-            guard audio != processing, audio != recordingAudio else { return }
-            queue.removeAll { $0 == audio }
+            guard !isBusy(r) else { return }
+            queue.removeAll { $0.lastPathComponent == r.id }
             try? FileManager.default.removeItem(at: audio)
             if audio.pathExtension != "rec" { try? FileManager.default.removeItem(at: RecordingMeta.url(for: audio)) }
         }
@@ -1451,7 +1512,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
     }
 
     private func enqueue(_ audio: URL) {
-        guard audio != processing, !queue.contains(audio),
+        let name = audio.lastPathComponent   // 同じ録音を二重に並べない（URLの書き方の違いに左右されないよう名前で比べる）
+        guard processing?.lastPathComponent != name, !queue.contains(where: { $0.lastPathComponent == name }),
               FileManager.default.fileExists(atPath: audio.path) else { return }
         queue.append(audio)
         if processing == nil { processNext() }
@@ -1467,6 +1529,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
         }
         let audio = queue.removeFirst()
         processing = audio
+        let token = UUID()
+        processingToken = token
         updateTitle()
         RecordingLog.update(audio) { $0.status = .transcribing }
         refreshRecordings()
@@ -1490,7 +1554,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
                 // Macの音を録った録音（オンライン授業）は、そちらを文字起こしする
                 let systemParts = meta.systemAudio == true ? self.systemAudioParts(of: audio) : []
                 let parts = systemParts.isEmpty ? self.audioParts(of: audio) : systemParts
-                let readable = parts.filter { (try? AVAudioFile(forReading: $0)) != nil }
+                // 中身のないファイル（スリープ明けに録音の切り替えに失敗したときなどにできる）は除く
+                let readable = parts.filter { Self.audioSeconds($0) >= 1 }
                 if readable.isEmpty {
                     RecordingLog.update(audio, meta: meta) {
                         $0.status = .broken
@@ -1502,7 +1567,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
                     self.processNext()
                     return
                 }
-                let duration = (meta.end ?? meta.start).timeIntervalSince(meta.start)
+                // 実際に録れている音声の長さ（ふたを閉じてスリープしていた時間は含まない）
+                let duration = readable.reduce(0) { $0 + Self.audioSeconds($1) }
                 var text: String
                 var method = "録音中に文字起こし"
                 if audio.pathExtension == "rec",
@@ -1517,19 +1583,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
                     var lines: [String] = []
                     var offset: TimeInterval = 0
                     for part in readable {
-                        let pieces = try await Transcriber.transcribe(url: part, language: meta.language ?? LiveCaptionOptions.japanese)
-                        lines += pieces.map { $0.line(offset: offset) }
-                        if let f = try? AVAudioFile(forReading: part), f.fileFormat.sampleRate > 0 {
-                            offset += Double(f.length) / f.fileFormat.sampleRate
-                        } else {
-                            offset += Self.segmentSeconds
+                        // 止まったままにならないよう、音声の長さに応じて時間切れにする
+                        let language = meta.language ?? LiveCaptionOptions.japanese
+                        let limit = max(180, Self.audioSeconds(part) * 3 + 60)
+                        let pieces = try await Transcriber.withTimeout(limit) {
+                            try await Transcriber.transcribe(url: part, language: language)
                         }
+                        lines += pieces.map { $0.line(offset: offset) }
+                        offset += Self.audioSeconds(part)
                     }
                     text = lines.joined(separator: "\n")
-                    if readable.count < parts.count {
-                        text += "\n\n（録音の一部（約\((parts.count - readable.count) * 5)分）を読み込めなかったため、その部分は含まれていません）"
+                    let unreadable = parts.filter { (try? AVAudioFile(forReading: $0)) == nil }.count
+                    if unreadable > 0 {
+                        text += "\n\n（録音の一部（約\(unreadable * 5)分）を読み込めなかったため、その部分は含まれていません）"
                     }
                 }
+                guard self.processingToken == token else { return }   // 履歴から止められた
                 let saved = try self.writeTranscript(meta: meta, text: text, audio: audio)
                 self.moveToDone(audio)
                 RecordingLog.update(audio, meta: meta) {
@@ -1542,6 +1611,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
                 self.notify("文字起こし完了：\(meta.name)",
                             "保存先フォルダに保存しました。")
             } catch {
+                guard self.processingToken == token else { return }   // 履歴から止められた
+                Log.write("文字起こしに失敗：\(recordingName ?? audio.lastPathComponent)：\(error.localizedDescription)")
                 self.failedAttempts[audio, default: 0] += 1
                 var gaveUp = false
                 RecordingLog.update(audio) {
@@ -1555,6 +1626,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
                                 "\(Self.maxTotalAttempts)回試してもできなかったので、自動でやり直すのをやめました。メニューの「録音履歴」から確認できます。")
                 }
             }
+            guard self.processingToken == token else { return }
             self.refreshRecordings()
             self.processNext()
         }
@@ -1607,6 +1679,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
             try? fm.removeItem(at: dst)
             try? fm.moveItem(at: src, to: dst)
         }
+    }
+
+    /// 音声ファイルの長さ（秒）。読めないファイルは 0
+    nonisolated static func audioSeconds(_ url: URL) -> TimeInterval {
+        guard let f = try? AVAudioFile(forReading: url), f.fileFormat.sampleRate > 0 else { return 0 }
+        return Double(f.length) / f.fileFormat.sampleRate
     }
 
     /// 録音フォルダ（.rec）なら中の5分ごとのファイル、以前の形式ならそのファイル自体
