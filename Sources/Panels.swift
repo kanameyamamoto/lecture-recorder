@@ -229,7 +229,9 @@ struct StartPanelView: View {
                                 Text("オフ").tag(0)
                                 Text("オン").tag(1)
                                 // 「英訳つき」は全角スペースで「日本語訳つき」と同じ6文字分にして、幅が変わらないようにする
-                                Text(model.language == LiveCaptionOptions.english ? "日本語訳つき" : "\u{3000}英訳つき\u{3000}").tag(2)
+                                Text(model.language == LiveCaptionOptions.english ? "日本語訳つき"
+                                     : model.language == LiveCaptionOptions.mixed ? "両方の訳つき"
+                                     : "\u{3000}英訳つき\u{3000}").tag(2)
                             }
                             .pickerStyle(.segmented)
                             .labelsHidden()

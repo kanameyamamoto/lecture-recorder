@@ -50,10 +50,16 @@ struct LiveCaptionOptions: Codable, Equatable {
         return [isEnglish ? Self.english : Self.japanese]
     }
 
-    /// 訳す元の言語（英語の授業は日本語訳、日本語・日本語と英語の授業は日本語の部分を英訳）
-    var translationSource: String { isEnglish ? Self.english : Self.japanese }
+    /// 訳す元の言語（日本語の授業は英訳、英語の授業は日本語訳、日本語と英語の授業はそれぞれ逆の言葉に訳す）
+    var translationSources: [String] {
+        if isMixed { return [Self.japanese, Self.english] }
+        return [isEnglish ? Self.english : Self.japanese]
+    }
 
-    var translationLabel: String { isEnglish ? "日本語訳" : "英訳" }
+    var translationLabel: String {
+        if isMixed { return "英訳・日本語訳" }
+        return isEnglish ? "日本語訳" : "英訳"
+    }
 
     var languageLabel: String {
         if isMixed { return "日英混在" }
@@ -124,17 +130,32 @@ final class LiveCaptionModel: ObservableObject {
         didSet { UserDefaults.standard.set(fontSize, forKey: "liveCaption.fontSize") }
     }
 
-    private var jobs: [UUID] = []
+    /// 訳をつけているか（録音の途中でも字幕ウィンドウのボタンで切り替えられる）
+    @Published private(set) var translates: Bool
+
+    private var jobs: [String: [UUID]] = [:]   // 訳す元の言語 → 翻訳待ちの行
     private static let maxLines = 300
 
     init(options: LiveCaptionOptions, title: String) {
         self.options = options
         self.title = title
+        translates = options.translate && LiveCaptionOptions.translationAvailable
         let saved = UserDefaults.standard.double(forKey: "liveCaption.fontSize")
         fontSize = saved > 0 ? saved : 16
     }
 
-    var translates: Bool { options.translate && LiveCaptionOptions.translationAvailable }
+    /// 訳をつける／やめる。つけたときは、それまでの字幕にもさかのぼって訳をつける
+    func setTranslating(_ on: Bool) {
+        guard LiveCaptionOptions.translationAvailable, translates != on else { return }
+        translates = on
+        jobs = [:]
+        if on {
+            for line in lines where line.translation == nil { requestTranslation(line.id) }
+        } else {
+            translationStatus = nil
+        }
+        revision += 1
+    }
 
     func setPartial(_ text: String) {
         guard partial != text else { return }
@@ -152,18 +173,22 @@ final class LiveCaptionModel: ObservableObject {
         return line.id
     }
 
-    /// 訳す元の言語の行だけ、翻訳待ちに入れる
+    /// 訳す元の言語の行だけ、その言語の翻訳待ちに入れる
     func requestTranslation(_ id: UUID) {
-        guard translates, !jobs.contains(id),
+        guard translates,
               let line = lines.first(where: { $0.id == id }),
-              line.lang == options.translationSource else { return }
-        jobs.append(id)
+              options.translationSources.contains(line.lang),
+              !(jobs[line.lang] ?? []).contains(id) else { return }
+        jobs[line.lang, default: []].append(id)
     }
 
-    func nextTranslationJob() -> (id: UUID, text: String)? {
-        while !jobs.isEmpty {
-            let id = jobs.removeFirst()
-            if let line = lines.first(where: { $0.id == id }), !line.text.isEmpty { return (id, line.text) }
+    func nextTranslationJob(from lang: String) -> (id: UUID, text: String)? {
+        while var list = jobs[lang], !list.isEmpty {
+            let id = list.removeFirst()
+            jobs[lang] = list
+            if let line = lines.first(where: { $0.id == id }), !line.text.isEmpty, line.translation == nil {
+                return (id, line.text)
+            }
         }
         return nil
     }
@@ -196,6 +221,13 @@ struct LiveCaptionView: View {
                 Image(systemName: "captions.bubble")
                 Text(header).lineLimit(1).padding(.leading, 2)
                 Spacer(minLength: 12)
+                if LiveCaptionOptions.translationAvailable {
+                    headerButton("translate",
+                                 help: model.translates ? "訳をやめる" : "\(model.options.translationLabel)をつける（それまでの字幕にもつけます）",
+                                 active: model.translates) {
+                        model.setTranslating(!model.translates)
+                    }
+                }
                 // 文字の大きさ（日本語の環境だと記号が「あ」になるので、英語の記号にそろえる）
                 headerButton("textformat.size.smaller", help: "文字を小さく") {
                     model.fontSize = max(11, model.fontSize - 2)
@@ -268,11 +300,14 @@ struct LiveCaptionView: View {
     }
 
     /// 上の列のボタン（大きさと間隔をそろえる）
-    private func headerButton(_ symbol: String, help: String, action: @escaping () -> Void) -> some View {
+    private func headerButton(_ symbol: String, help: String, active: Bool = false,
+                              action: @escaping () -> Void) -> some View {
         Button(action: action) {
             Image(systemName: symbol)
                 .font(.system(size: 12, weight: .medium))
+                .foregroundStyle(active ? Color.white : Color.white.opacity(0.65))
                 .frame(width: 24, height: 22)
+                .background(RoundedRectangle(cornerRadius: 5).fill(active ? Color.white.opacity(0.18) : Color.clear))
                 .contentShape(Rectangle())
         }
         .buttonStyle(.borderless)
@@ -288,19 +323,20 @@ struct LiveCaptionView: View {
     }
 }
 
-/// macOS 15 以降なら、字幕の行を順に翻訳する
+/// macOS 15 以降なら、字幕の行を順に翻訳する（訳す元の言語ごとに1つずつ）
 private struct TranslationRunner: ViewModifier {
-    let model: LiveCaptionModel
+    @ObservedObject var model: LiveCaptionModel
 
     @ViewBuilder
     func body(content: Content) -> some View {
         #if canImport(Translation)
-        if model.translates {
-            if #available(macOS 15.0, *) {
-                content.modifier(TranslationTaskModifier(model: model))
-            } else {
-                content
-            }
+        if #available(macOS 15.0, *) {
+            let sources = model.options.translationSources
+            content
+                .modifier(TranslationTaskModifier(model: model, from: LiveCaptionOptions.japanese,
+                                                  active: model.translates && sources.contains(LiveCaptionOptions.japanese)))
+                .modifier(TranslationTaskModifier(model: model, from: LiveCaptionOptions.english,
+                                                  active: model.translates && sources.contains(LiveCaptionOptions.english)))
         } else {
             content
         }
@@ -314,21 +350,24 @@ private struct TranslationRunner: ViewModifier {
 @available(macOS 15.0, *)
 private struct TranslationTaskModifier: ViewModifier {
     let model: LiveCaptionModel
-    let configuration: TranslationSession.Configuration
+    let lang: String
+    let configuration: TranslationSession.Configuration?   // nil のあいだは訳さない
     let source: Locale.Language
     let target: Locale.Language
 
-    init(model: LiveCaptionModel) {
+    init(model: LiveCaptionModel, from lang: String, active: Bool) {
         self.model = model
-        let fromEnglish = model.options.translationSource == LiveCaptionOptions.english
+        self.lang = lang
+        let fromEnglish = lang == LiveCaptionOptions.english
         source = Locale.Language(identifier: fromEnglish ? "en" : "ja")
         target = Locale.Language(identifier: fromEnglish ? "ja" : "en")
-        configuration = TranslationSession.Configuration(source: source, target: target)
+        configuration = active ? TranslationSession.Configuration(source: source, target: target) : nil
     }
 
     func body(content: Content) -> some View {
         content.translationTask(configuration) { session in
             let model = self.model
+            let lang = self.lang
             let status = await LanguageAvailability().status(from: source, to: target)
             switch status {
             case .installed:
@@ -351,7 +390,7 @@ private struct TranslationTaskModifier: ViewModifier {
                 break
             }
             while !Task.isCancelled {
-                if let job = await model.nextTranslationJob() {
+                if let job = await model.nextTranslationJob(from: lang) {
                     do {
                         let response = try await session.translate(job.text)
                         await model.setTranslation(response.targetText, for: job.id)
