@@ -225,18 +225,18 @@ struct StartPanelView: View {
                             .disabled(!SystemAudioCapture.isSupported)
                         }
                         row("字幕") {
+                            // 訳は英語を日本語にするだけなので、日本語の授業では「日本語訳」を出さない
                             Picker("", selection: captionMode) {
                                 Text("オフ").tag(0)
                                 Text("オン").tag(1)
-                                // 「英訳つき」は全角スペースで「日本語訳つき」と同じ6文字分にして、幅が変わらないようにする
-                                Text(model.language == LiveCaptionOptions.english ? "日本語訳つき"
-                                     : model.language == LiveCaptionOptions.mixed ? "両方の訳つき"
-                                     : "\u{3000}英訳つき\u{3000}").tag(2)
+                                if model.language != LiveCaptionOptions.japanese && LiveCaptionOptions.translationAvailable {
+                                    Text("日本語訳").tag(2)
+                                }
                             }
                             .pickerStyle(.segmented)
                             .labelsHidden()
                             .fixedSize()
-                            .id(model.language)   // 訳の名前が変わったら作り直す（幅がずれて崩れないように）
+                            .id(model.language == LiveCaptionOptions.japanese)   // ボタンの数が変わったら作り直す（崩れないように）
                         }
                     }
                 }
@@ -281,7 +281,7 @@ struct StartPanelView: View {
     /// 字幕：0 = オフ、1 = オン、2 = 訳つき（訳はこのMacで使えなければオンと同じ）
     private var captionMode: Binding<Int> {
         Binding(
-            get: { !model.captionsOn ? 0 : (model.captionTranslate && LiveCaptionOptions.translationAvailable ? 2 : 1) },
+            get: { !model.captionsOn ? 0 : (model.captionTranslate && model.captionOptions.canTranslate ? 2 : 1) },
             set: { v in
                 model.captionsOn = v > 0
                 model.captionTranslate = v == 2

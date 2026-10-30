@@ -50,16 +50,13 @@ struct LiveCaptionOptions: Codable, Equatable {
         return [isEnglish ? Self.english : Self.japanese]
     }
 
-    /// 訳す元の言語（日本語の授業は英訳、英語の授業は日本語訳、日本語と英語の授業はそれぞれ逆の言葉に訳す）
-    var translationSources: [String] {
-        if isMixed { return [Self.japanese, Self.english] }
-        return [isEnglish ? Self.english : Self.japanese]
-    }
+    /// 訳す元の言語。英語だけを日本語に訳す（日本語の授業は訳なし、日本語と英語の授業は英語の部分だけ）
+    var translationSources: [String] { isEnglish || isMixed ? [Self.english] : [] }
 
-    var translationLabel: String {
-        if isMixed { return "英訳・日本語訳" }
-        return isEnglish ? "日本語訳" : "英訳"
-    }
+    /// この授業で訳がつけられるか
+    var canTranslate: Bool { !translationSources.isEmpty && Self.translationAvailable }
+
+    var translationLabel: String { "日本語訳" }
 
     var languageLabel: String {
         if isMixed { return "日英混在" }
@@ -139,14 +136,14 @@ final class LiveCaptionModel: ObservableObject {
     init(options: LiveCaptionOptions, title: String) {
         self.options = options
         self.title = title
-        translates = options.translate && LiveCaptionOptions.translationAvailable
+        translates = options.translate && options.canTranslate
         let saved = UserDefaults.standard.double(forKey: "liveCaption.fontSize")
         fontSize = saved > 0 ? saved : 16
     }
 
     /// 訳をつける／やめる。つけたときは、それまでの字幕にもさかのぼって訳をつける
     func setTranslating(_ on: Bool) {
-        guard LiveCaptionOptions.translationAvailable, translates != on else { return }
+        guard options.canTranslate, translates != on else { return }
         translates = on
         jobs = [:]
         if on {
@@ -221,7 +218,7 @@ struct LiveCaptionView: View {
                 Image(systemName: "captions.bubble")
                 Text(header).lineLimit(1).padding(.leading, 2)
                 Spacer(minLength: 12)
-                if LiveCaptionOptions.translationAvailable {
+                if model.options.canTranslate {
                     headerButton("translate",
                                  help: model.translates ? "訳をやめる" : "\(model.options.translationLabel)をつける（それまでの字幕にもつけます）",
                                  active: model.translates) {
