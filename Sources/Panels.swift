@@ -1,5 +1,6 @@
 // 講義の録音開始の確認画面と、出席履歴の画面
 
+import AppKit
 import SwiftUI
 
 private let jpLocale = Locale(identifier: "ja_JP")
@@ -225,18 +226,10 @@ struct StartPanelView: View {
                             .disabled(!SystemAudioCapture.isSupported)
                         }
                         row("字幕") {
-                            // 訳は英語を日本語にするだけなので、日本語の授業では「日本語訳」を出さない
-                            Picker("", selection: captionMode) {
-                                Text("オフ").tag(0)
-                                Text("オン").tag(1)
-                                if model.language != LiveCaptionOptions.japanese && LiveCaptionOptions.translationAvailable {
-                                    Text("日本語訳").tag(2)
-                                }
-                            }
-                            .pickerStyle(.segmented)
-                            .labelsHidden()
-                            .fixedSize()
-                            .id(model.language == LiveCaptionOptions.japanese)   // ボタンの数が変わったら作り直す（崩れないように）
+                            // 訳は英語を日本語にするだけなので、日本語の授業では「日本語訳」を押せなくする
+                            // （ボタンの数は変えず、大きさがいつも同じになるように）
+                            CaptionModePicker(selection: captionMode,
+                                              translationEnabled: model.captionOptions.canTranslate)
                         }
                     }
                 }
@@ -297,6 +290,39 @@ struct StartPanelView: View {
             Spacer(minLength: 0)
         }
     }
+}
+
+/// 字幕の切り替え（オフ／オン／日本語訳）。
+/// SwiftUI の切り替えでは1つだけ押せなくすることができないので、Mac標準の部品を直接使う
+struct CaptionModePicker: NSViewRepresentable {
+    @Binding var selection: Int
+    var translationEnabled: Bool
+
+    func makeCoordinator() -> SegmentTarget { SegmentTarget() }
+
+    func makeNSView(context: Context) -> NSSegmentedControl {
+        let control = NSSegmentedControl(labels: ["オフ", "オン", "日本語訳"], trackingMode: .selectOne,
+                                         target: context.coordinator, action: #selector(SegmentTarget.changed(_:)))
+        control.segmentDistribution = .fit
+        return control
+    }
+
+    func updateNSView(_ control: NSSegmentedControl, context: Context) {
+        let binding = $selection
+        context.coordinator.onChange = { binding.wrappedValue = $0 }
+        control.setEnabled(translationEnabled, forSegment: 2)
+        control.selectedSegment = selection
+    }
+
+    func sizeThatFits(_ proposal: ProposedViewSize, nsView: NSSegmentedControl, context: Context) -> CGSize? {
+        nsView.intrinsicContentSize
+    }
+}
+
+/// 切り替えが押されたときの受け口
+final class SegmentTarget: NSObject {
+    var onChange: ((Int) -> Void)?
+    @objc func changed(_ sender: NSSegmentedControl) { onChange?(sender.selectedSegment) }
 }
 
 // MARK: - 出席履歴
